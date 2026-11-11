@@ -21,7 +21,7 @@ public:
 
 protected:
     bool tryExecuteFastPath(const int8_t* query, int8_t* output, int seqLen, int kvSeqLen, int paddingLength,
-                            float qScale, float attentionScale, bool lowerTriangular, bool hasSinks, bool outputC4,
+                            float qScale, float attentionScale, bool lowerTriangular, const float* sinks, bool outputC4,
                             bool directC4Output) override;
     CPUAttention* createClone(Backend* backend) const override;
 };

@@ -14,6 +14,7 @@
 #include "core/AttentionMaskConvention.hpp"
 #include "MNNTestSuite.h"
 #include "TestUtils.h"
+#include <cmath>
 #include <stdlib.h>
 #include <vector>
 #include <MNN/AutoTime.hpp>
@@ -34,10 +35,9 @@ const int pastLength = 101;
 #define GENERATE_TOKENS 128
 
 static KVMeta gMeta;
-static std::shared_ptr<Module> _makeAttentionModule(int attentionMode = 8, bool outputC4 = false,
-                                                    bool forceOpenCLBuffer = false, int numThread = -1,
-                                                    KVMeta* meta = &gMeta,
-                                                    const std::string& prefixCacheDir = std::string()) {
+static std::shared_ptr<Module>
+_makeAttentionModule(int attentionMode = 8, bool outputC4 = false, bool forceOpenCLBuffer = false, int numThread = -1,
+                     KVMeta* meta = &gMeta, const std::string& prefixCacheDir = std::string(), VARP sinks = {}) {
     auto Q = _Input();
     auto K = _Input();
     auto V = _Input();
@@ -48,7 +48,11 @@ static std::shared_ptr<Module> _makeAttentionModule(int attentionMode = 8, bool 
     attention->main.value = new MNN::AttentionParamT;
     attention->main.AsAttentionParam()->kv_cache = true;
     attention->main.AsAttentionParam()->output_c4 = outputC4;
-    auto o = Variable::create(Expr::create(attention.get(), {Q, K, V, mask}));
+    std::vector<VARP> inputs{Q, K, V, mask};
+    if (sinks.get() != nullptr) {
+        inputs.push_back(sinks);
+    }
+    auto o = Variable::create(Expr::create(attention.get(), inputs));
     auto buffer = Variable::save({o});
     MNN::ScheduleConfig config;
     auto status = MNNTestSuite::get()->pStaus;
@@ -1977,6 +1981,90 @@ static VARP _scalarMask() {
     m->writeMap<float>()[0] = 0.0f;
     return m;
 }
+
+class AttentionDecodeSinkTest : public MNNTestCase {
+public:
+    bool run(int precision) override {
+        if (MNNTestSuite::get()->pStaus.forwardType != MNN_FORWARD_CPU) {
+            return true;
+        }
+        for (int headDim : {5, 512}) {
+            if (!runCase(headDim, false) || !runCase(headDim, true)) {
+                return false;
+            }
+        }
+        if (precision == MNN::BackendConfig::Precision_Normal || precision == MNN::BackendConfig::Precision_High) {
+            return runCase(512, false, true) && runCase(512, true, true);
+        }
+        return true;
+    }
+
+private:
+    static bool runCase(int headDim, bool outputC4, bool largeLogit = false) {
+        const float sinks[] = {-6.0f, 0.0f, 2.0f, 8.0f};
+        const int heads = sizeof(sinks) / sizeof(sinks[0]);
+        KVMeta meta;
+        auto module = _makeAttentionModule(0, outputC4, false, -1, &meta, {}, _Const(sinks, {heads}, NCHW));
+        if (!module) {
+            return false;
+        }
+        std::vector<std::vector<std::vector<float>>> q(
+            1, std::vector<std::vector<float>>(heads, std::vector<float>(headDim)));
+        std::vector<std::vector<std::vector<float>>> k(1,
+                                                       std::vector<std::vector<float>>(1, std::vector<float>(headDim)));
+        auto v = k;
+        for (int h = 0; h < heads; ++h) {
+            q[0][h][0] = largeLogit ? 7.0e19f : std::sqrt(static_cast<float>(headDim)) * (h + 1) * 0.25f;
+        }
+        const int steps = largeLogit ? 1 : 6;
+        for (int pos = 0; pos < steps; ++pos) {
+            k[0][0][0] = largeLogit ? 7.0e19f : pos - 2;
+            for (int d = 0; d < headDim; ++d) {
+                v[0][0][d] = (pos + 1) * (1 + d % 7) * 0.125f;
+            }
+            meta.add = 1;
+            auto result = module->onForward({_rowsToVar(q, 1), _rowsToVar(k, 1), _rowsToVar(v, 1), _scalarMask()});
+            if (result.empty()) {
+                return false;
+            }
+            auto output = outputC4 ? _Convert(result[0], NCHW) : result[0];
+            const auto* info = output->getInfo();
+            if (info == nullptr || info->size != heads * headDim) {
+                return false;
+            }
+            auto data = output->readMap<float>();
+            if (data == nullptr) {
+                return false;
+            }
+            for (int h = 0; h < heads; ++h) {
+                // The large finite QK logit dominates the sink, so the single value has weight 1.
+                double weightedStep = 1.0;
+                if (!largeLogit) {
+                    double denom = std::exp(static_cast<double>(sinks[h]));
+                    double sum = 0.0;
+                    for (int t = 0; t <= pos; ++t) {
+                        double w = std::exp((t - 2) * (h + 1) * 0.25);
+                        denom += w;
+                        sum += w * (t + 1);
+                    }
+                    weightedStep = sum / denom;
+                }
+                for (int d = 0; d < headDim; ++d) {
+                    const double expected = weightedStep * (1 + d % 7) * 0.125;
+                    const float actual = data[h * headDim + d];
+                    if (!(std::abs(actual - expected) < 0.003)) {
+                        MNN_PRINT("Attention sink mismatch: kv=%d, head=%d, dim=%d, C4=%d, got=%f, expected=%f\n",
+                                  pos + 1, h, d, outputC4, actual, expected);
+                        return false;
+                    }
+                }
+            }
+            meta.sync();
+        }
+        return true;
+    }
+};
+MNNTestSuiteRegister(AttentionDecodeSinkTest, "op/attention_decode_sink");
 
 // Static KV quantization via AttentionParam.mhq_quant (4 scales:
 // q, k, qk, v). kScale/vScale != 0 turns on int8 KV storage.

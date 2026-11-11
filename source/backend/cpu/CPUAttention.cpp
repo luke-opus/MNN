@@ -534,7 +534,7 @@ ErrorCode CPUAttention::onExecute(const std::vector<Tensor*>& inputs, const std:
 
 #ifdef MNN_USE_RVV
     if (tryExecuteFastPath(queryPtr, outputs[0]->host<int8_t>(), seqLen, kvSeqLen, padSeqLength, q_scale, mScale,
-                           isLowerTriangular, sinksPtr != nullptr, outputC4, directC4Output)) {
+                           isLowerTriangular, sinksPtr, outputC4, directC4Output)) {
         if (!mKVCache) {
             mKVCacheManager->onClear();
         }
@@ -1611,7 +1611,7 @@ CPUAttention::CPUAttention(Backend* backend, bool kvCache) : Execution(backend),
 }
 
 bool CPUAttention::tryExecuteFastPath(const int8_t* query, int8_t* output, int seqLen, int kvSeqLen, int paddingLength,
-                                      float qScale, float attentionScale, bool lowerTriangular, bool hasSinks,
+                                      float qScale, float attentionScale, bool lowerTriangular, const float* sinks,
                                       bool outputC4, bool directC4Output) {
     return false;
 }

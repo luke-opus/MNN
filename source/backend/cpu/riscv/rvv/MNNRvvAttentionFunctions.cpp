@@ -61,10 +61,10 @@ bool MNNRvvAttention::acquireDecodeScratch(int capacity) {
 
 bool MNNRvvAttention::tryExecuteFastPath(const int8_t* query, int8_t* output, int seqLen, int kvSeqLen,
                                          int paddingLength, float qScale, float attentionScale, bool lowerTriangular,
-                                         bool hasSinks, bool outputC4, bool directC4Output) {
+                                         const float* sinks, bool outputC4, bool directC4Output) {
     if (seqLen != 1 || mUseFlashAttention || mKeyQuantMode != KVQuantMode::None ||
         mValueQuantMode != KVQuantMode::None || mBytes != 4 || mPack != 4 || hP != 4 || lP != 1 || qScale != 1.0f ||
-        !lowerTriangular || hasSinks || kvSeqLen != mKvBlockSize || mThreadNum <= 0 || mQNumHead <= 0 || mKvNumHead <= 0 ||
+        !lowerTriangular || kvSeqLen != mKvBlockSize || mThreadNum <= 0 || mQNumHead <= 0 || mKvNumHead <= 0 ||
         mQNumHead % mKvNumHead != 0 || query == nullptr || output == nullptr) {
         return false;
     }
@@ -98,7 +98,9 @@ bool MNNRvvAttention::tryExecuteFastPath(const int8_t* query, int8_t* output, in
     const size_t requiredOutputBytes = static_cast<size_t>(ROUND_UP(mHeadDim, mPack) * mBytes);
     int8_t* outputWorkspace = mPackQKV ? mPackQKV->host<int8_t>() : nullptr;
     size_t outputWorkspaceStride = mPackQKV ? mPackQKV->stride(0) : 0;
-    if (!directC4Output && (outputWorkspace == nullptr || outputWorkspaceStride < requiredOutputBytes)) {
+    const bool scaleQuery = sinks != nullptr && attentionScale != 1.0f;
+    const bool needsWorkspace = scaleQuery || !directC4Output;
+    if (needsWorkspace && (outputWorkspace == nullptr || outputWorkspaceStride < requiredOutputBytes)) {
         if (transientScratch) {
             backend()->onReleaseBuffer(transientScratch.get(), Backend::STATIC);
         }
@@ -113,12 +115,20 @@ bool MNNRvvAttention::tryExecuteFastPath(const int8_t* query, int8_t* output, in
         const int headEnd = ALIMIN(mQNumHead, headBegin + headsPerThread);
         auto score = reinterpret_cast<float*>(scoreBase + static_cast<size_t>(tId) * scoreStride);
         auto outputScratch =
-            directC4Output ? nullptr : outputWorkspace + static_cast<size_t>(tId) * outputWorkspaceStride;
+            needsWorkspace ? outputWorkspace + static_cast<size_t>(tId) * outputWorkspaceStride : nullptr;
         for (int head = headBegin; head < headEnd; ++head) {
             const int kvHead = head / groupSize;
             auto key = reinterpret_cast<const float*>(mKVCacheManager->addrOfKey(kvHead));
             auto value = reinterpret_cast<const float*>(mKVCacheManager->addrOfValue(kvHead));
             auto headQuery = reinterpret_cast<const float*>(query + static_cast<size_t>(head) * mHeadDim * mBytes);
+            if (scaleQuery) {
+                // Match the CPU fallback's scaling order without allocating another per-head buffer.
+                auto scaledQuery = reinterpret_cast<float*>(outputScratch);
+                for (int d = 0; d < mHeadDim; ++d) {
+                    scaledQuery[d] = headQuery[d] * attentionScale;
+                }
+                headQuery = scaledQuery;
+            }
 
             size_t qkParameters[7] = {
                 static_cast<size_t>(eP * lP * mBytes),
@@ -131,10 +141,17 @@ bool MNNRvvAttention::tryExecuteFastPath(const int8_t* query, int8_t* output, in
             };
             MNNPackedMatMulRemainFP32_RVV_WithAStride(score, headQuery, key, 1, qkParameters, nullptr, nullptr, nullptr,
                                                       nullptr, 1);
-            for (int i = 0; i < kvSeqLen; ++i) {
-                score[i] *= attentionScale;
+            if (sinks != nullptr) {
+                // The sink adds a logit to the denominator, but has no value row.
+                float sinkMax = sinks[head];
+                float sinkSum = 1.0f;
+                core->MNNSoftmax(score, score, &sinkMax, &sinkSum, nullptr, 1, kvSeqLen, 0, kvSeqLen - 1, mPack, true);
+            } else {
+                for (int i = 0; i < kvSeqLen; ++i) {
+                    score[i] *= attentionScale;
+                }
+                core->MNNSoftmax(score, score, nullptr, nullptr, nullptr, 1, kvSeqLen, 0, kvSeqLen - 1, mPack, true);
             }
-            core->MNNSoftmax(score, score, nullptr, nullptr, nullptr, 1, kvSeqLen, 0, kvSeqLen - 1, mPack, true);
 
             int8_t* packedOutput =
                 directC4Output ? output + static_cast<size_t>(head) * mHeadDim * mBytes : outputScratch;
